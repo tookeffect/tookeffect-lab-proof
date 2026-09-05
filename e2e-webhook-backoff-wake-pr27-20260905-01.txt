@@ -1,0 +1,10 @@
+TookEffect lab-only fixture for GitHub webhook backoff wake verification.
+
+This file is intentionally harmless. It exists only to provide a disposable pull request for an external-effect E2E test.
+
+Expected flow:
+- declare external intent first in TookEffect
+- merge this PR directly in GitHub outside TookEffect execution
+- GitHub webhook wakes the already-pending Effect even if it is sleeping in backoff
+- TookEffect performs authoritative GitHub read-back
+- terminal APPLIED Evidence + signed Receipt remain provider-authoritative
