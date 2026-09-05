@@ -1,0 +1,9 @@
+TookEffect lab-only fixture.
+Purpose: verify GitHub pull_request webhook delivery after enabling the Pull request event subscription on the TookEffect GitHub App.
+Expected invariants:
+- declare intent before merge
+- merge happens directly in GitHub, outside TookEffect execution
+- webhook is wake-only and never Evidence
+- TookEffect independently reads GitHub authoritative state
+- final verdict may only be based on authoritative read-back
+- audit must record effect.external_verification_woken with source GITHUB_WEBHOOK
