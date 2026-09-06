@@ -1,0 +1,130 @@
+name: Vercel Observe-Only direct E2E
+
+on:
+  push:
+    branches:
+      - e2e/vercel-observe-only-direct-20260906-01
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TOOKEFFECT_BASE_URL: https://tookeffect.com
+      TARGET_ID: f968525a-b811-4684-b446-0e6e7380fb79
+      PROJECT_ID: prj_NGrDyvrYPclOEUNpzczSyKwbJ717
+      TEAM_ID: team_hn5236LnuYECIVNaMIYISlUj
+      PREVIEW_ID: dpl_CncU2LvJC4aii56eK3CWbQGvxWjp
+      IDEMPOTENCY_KEY: e2e-vercel-observe-only-postcert-20260906-01
+    steps:
+      - name: Preflight required credentials
+        env:
+          TOOKEFFECT_TOKEN: ${{ secrets.TOOKEFFECT_TOKEN }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${TOOKEFFECT_TOKEN:-}" ]]; then
+            echo "::error::TOOKEFFECT_TOKEN is not configured; no Effect was declared and no Vercel promotion was attempted."
+            exit 1
+          fi
+          if [[ -z "${VERCEL_TOKEN:-}" ]]; then
+            echo "::error::VERCEL_TOKEN is not configured; no Effect was declared and no Vercel promotion was attempted."
+            exit 1
+          fi
+
+      - name: Declare external Vercel promotion intent before action
+        id: declare
+        env:
+          TOOKEFFECT_TOKEN: ${{ secrets.TOOKEFFECT_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          payload="$(node - <<'NODE'
+          const payload = {
+            provider: "vercel",
+            effectType: "vercel.verify_promotion",
+            targetId: process.env.TARGET_ID,
+            intent: {
+              targetId: process.env.TARGET_ID,
+              projectId: process.env.PROJECT_ID,
+              deploymentId: process.env.PREVIEW_ID,
+              sourceDeploymentId: process.env.PREVIEW_ID,
+            },
+          };
+          process.stdout.write(JSON.stringify(payload));
+          NODE
+          )"
+          code="$(curl --silent --show-error --output declare-response.json --write-out "%{http_code}" -X POST -H "Authorization: Bearer ${TOOKEFFECT_TOKEN}" -H "Content-Type: application/json" -H "Accept: application/json" -H "Idempotency-Key: ${IDEMPOTENCY_KEY}" --data "$payload" "${TOOKEFFECT_BASE_URL}/api/v1/effects/declare-external")"
+          if [[ "$code" != "202" ]]; then
+            echo "::error::External intent declaration failed with HTTP ${code}; Vercel promotion will not be attempted."
+            cat declare-response.json
+            exit 1
+          fi
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const r = JSON.parse(fs.readFileSync('declare-response.json','utf8'));
+          if (!/^[0-9a-f-]{36}$/i.test(String(r.effectId || ''))) throw new Error('missing_effect_id');
+          if (r.status === 'completed') throw new Error('effect_finalized_before_external_action');
+          if (r.actionAttempted === true) throw new Error('observe_only_action_attempted_during_declaration');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `effect_id=${r.effectId}\n`);
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `### External intent declared before Vercel action\n\n- Effect ID: \`${r.effectId}\`\n- Correlation ID: \`${r.correlationId || ''}\`\n- Status: \`${r.status || ''}\`\n- actionAttempted: \`${String(r.actionAttempted ?? false)}\`\n`);
+          NODE
+
+      - name: Promote the exact Preview directly in Vercel
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          code="$(curl --silent --show-error --output vercel-promote-response.txt --write-out "%{http_code}" -X POST -H "Authorization: Bearer ${VERCEL_TOKEN}" -H "Accept: application/json" "https://api.vercel.com/v10/projects/${PROJECT_ID}/promote/${PREVIEW_ID}?teamId=${TEAM_ID}")"
+          if [[ "$code" != "201" && "$code" != "202" ]]; then
+            echo "::error::Direct Vercel promotion failed with HTTP ${code}."
+            cat vercel-promote-response.txt
+            exit 1
+          fi
+          {
+            echo
+            echo "### Direct provider action"
+            echo
+            echo "- Vercel project: \`${PROJECT_ID}\`"
+            echo "- Promoted Preview: \`${PREVIEW_ID}\`"
+            echo "- HTTP: \`${code}\`"
+            echo "- TookEffect executor used: \`false\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Wait for webhook-driven authoritative verification
+        env:
+          TOOKEFFECT_TOKEN: ${{ secrets.TOOKEFFECT_TOKEN }}
+          EFFECT_ID: ${{ steps.declare.outputs.effect_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > last-status.json
+          for attempt in $(seq 1 60); do
+            code="$(curl --silent --show-error --output last-status.json --write-out "%{http_code}" -H "Authorization: Bearer ${TOOKEFFECT_TOKEN}" -H "Accept: application/json" "${TOOKEFFECT_BASE_URL}/api/v1/effects/${EFFECT_ID}")"
+            if [[ "$code" != "200" ]]; then
+              echo "::error::Effect status read failed with HTTP ${code}."
+              cat last-status.json
+              exit 1
+            fi
+            state="$(node -e 'const fs=require("node:fs"); const r=JSON.parse(fs.readFileSync("last-status.json","utf8")); process.stdout.write(String(r.status||""))')"
+            if [[ "$state" == "completed" ]]; then break; fi
+            sleep 3
+          done
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const r = JSON.parse(fs.readFileSync('last-status.json','utf8'));
+          if (r.status !== 'completed') throw new Error(`effect_not_completed:${r.status || 'missing'}`);
+          if (r.verdict !== 'APPLIED') throw new Error(`unexpected_verdict:${r.verdict || 'missing'}:${r.reason || ''}`);
+          if (r.actionAttempted !== false) throw new Error(`actionAttempted_not_false:${String(r.actionAttempted)}`);
+          if (!r.evidence || typeof r.evidence !== 'object') throw new Error('evidence_missing');
+          if (r.receipt?.mode !== 'jws-ed25519') throw new Error(`receipt_mode_invalid:${r.receipt?.mode || 'missing'}`);
+          if (String(r.receipt?.signature || '').split('.').length !== 3) throw new Error('receipt_signature_missing');
+          if (!r.receipt?.evidenceDigest || !r.receipt?.keyId || !r.receipt?.jwksUrl) throw new Error('receipt_metadata_incomplete');
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `\n### Observe-Only verification result\n\n- Effect ID: \`${r.effectId}\`\n- Status: \`${r.status}\`\n- Verdict: \`${r.verdict}\`\n- Reason: \`${r.reason || ''}\`\n- actionAttempted: \`${String(r.actionAttempted)}\`\n- Receipt mode: \`${r.receipt.mode}\`\n- Evidence digest: \`${r.receipt.evidenceDigest}\`\n- Receipt key: \`${r.receipt.keyId}\`\n`);
+          console.log(JSON.stringify({effectId:r.effectId,status:r.status,verdict:r.verdict,reason:r.reason,actionAttempted:r.actionAttempted,receipt:{mode:r.receipt.mode,evidenceDigest:r.receipt.evidenceDigest,keyId:r.receipt.keyId,jwksUrl:r.receipt.jwksUrl},evidence:r.evidence}, null, 2));
+          NODE
