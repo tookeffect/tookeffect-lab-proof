@@ -43,6 +43,7 @@ jobs:
       - name: Generate ephemeral submitter key
         run: |
           sigsum-key generate -o submit-key
+          sigsum-key to-hex -k submit-key.pub | sed 's/^/submitterPublicKey=/'
           sigsum-key to-hash -k submit-key.pub | sed 's/^/submitterKeyHash=/'
       - name: Submit to barreleye and collect proof
         run: |
