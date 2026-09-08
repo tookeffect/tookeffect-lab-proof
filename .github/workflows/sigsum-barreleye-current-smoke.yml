@@ -1,0 +1,68 @@
+name: Sigsum barreleye current smoke
+
+on:
+  push:
+    branches:
+      - smoke/sigsum-barreleye-current-20260907
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+      - name: Install pinned Sigsum tools
+        run: |
+          go install sigsum.org/sigsum-go/cmd/sigsum-key@v0.14.1
+          go install sigsum.org/sigsum-go/cmd/sigsum-policy@v0.14.1
+          go install sigsum.org/sigsum-go/cmd/sigsum-submit@v0.14.1
+          go install sigsum.org/sigsum-go/cmd/sigsum-verify@v0.14.1
+      - name: Confirm pinned test policy
+        run: |
+          sigsum-policy show sigsum-test1-2025 | tee policy.txt
+          grep -F 'log 4644af2abd40f4895a003bca350f9d5912ab301a49c77f13e5b6d905c20a5fe6 https://test.sigsum.org/barreleye' policy.txt
+          grep -F 'witness rgdd.se/poc-witness          28c92a5a3a054d317c86fc2eeb6a7ab2054d6217100d0be67ded5b74323c5806' policy.txt
+          grep -F 'group quorum-rule 2 poc.sigsum.org/nisse rgdd.se/poc-witness witness1.smartit.nu/witness1' policy.txt
+      - name: Build synthetic TookEffect-bound artifact
+        run: |
+          CHECKPOINT_DIGEST='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+          CHECKPOINT_JWS="synthetic-checkpoint-${GITHUB_RUN_ID}"
+          printf 'tookeffect/sigsum/v1\n%s\n%s' "$CHECKPOINT_DIGEST" "$CHECKPOINT_JWS" > artifact.txt
+          MESSAGE=$(sha256sum artifact.txt | cut -d' ' -f1)
+          CHECKSUM=$(printf '%s' "$MESSAGE" | xxd -r -p | sha256sum | cut -d' ' -f1)
+          echo "checkpointDigest=$CHECKPOINT_DIGEST"
+          echo "checkpointJws=$CHECKPOINT_JWS"
+          echo "message=$MESSAGE"
+          echo "checksum=$CHECKSUM"
+      - name: Generate ephemeral submitter key
+        run: |
+          sigsum-key generate -o submit-key
+          sigsum-key to-hash -k submit-key.pub | sed 's/^/submitterKeyHash=/'
+      - name: Submit to barreleye and collect proof
+        run: |
+          sigsum-submit -P sigsum-test1-2025 -k submit-key artifact.txt
+          test -s artifact.txt.proof
+      - name: Offline verify collected proof
+        run: |
+          sigsum-verify -k submit-key.pub -P sigsum-test1-2025 artifact.txt.proof < artifact.txt
+          echo 'offlineVerification=VERIFIED'
+      - name: Public smoke evidence
+        run: |
+          echo 'smoke=PASS'
+          echo 'provider=sigsum'
+          echo 'log=barreleye'
+          echo 'environment=TEST'
+          echo 'synthetic=true'
+          echo 'dnsChanged=false'
+          echo 'privateKeyPersisted=false'
+          echo '--- proof ---'
+          cat artifact.txt.proof
+      - name: Destroy ephemeral private key
+        if: always()
+        run: rm -f submit-key submit-key.pub
