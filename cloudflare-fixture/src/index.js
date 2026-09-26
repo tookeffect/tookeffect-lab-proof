@@ -1,4 +1,4 @@
-const MARKER = "cloudflare-artifact-baseline-586";
+const MARKER = "cloudflare-observe-only-e2e-20260906-01";
 
 export default {
   async fetch() {
